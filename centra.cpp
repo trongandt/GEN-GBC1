@@ -1,0 +1,291 @@
+// CentRA for set betweenness: progressive i.i.d. internal shortest paths,
+// greedy maximum coverage, AMCERA bound and the paper's stopping inequality.
+// Reference: Pellegrina, KDD 2023, Algorithm 1 / Theorem 4.4 / Eq. (2).
+// Continue progressive sampling until the paper's stopping inequality holds.
+// Each sampled path and each Rademacher sign is independent.
+// Inlined shared graph and sampling helpers for single-file Colab use.
+// Shared unweighted graph, uniform shortest-path sampler, and group coverage.
+// Every sampled hyperedge contains internal vertices only; unreachable pairs
+// and direct edges yield an empty hyperedge. Vertex labels remain external.
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <numeric>
+#include <queue>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+namespace gbc {
+using Label=std::int64_t;
+using Path=std::vector<int>;
+struct Graph {
+    bool directed=false;
+    std::vector<Label> labels;
+    std::vector<std::vector<int>> out, incoming;
+    std::size_t m=0;
+    int n()const{return static_cast<int>(labels.size());}
+};
+inline Graph load(const std::string& filename,bool directed) {
+    std::ifstream file(filename);
+    if(!file)throw std::runtime_error("Cannot open graph: "+filename);
+    std::vector<std::pair<Label,Label>> edges;
+    std::vector<Label> labels;
+    std::string line;
+    while(std::getline(file,line)) {
+        auto p=line.find_first_not_of(" \t\r\n");
+        if(p==std::string::npos||line[p]=='#'||line[p]=='%')continue;
+        std::istringstream row(line); Label u,v;
+        if(!(row>>u>>v))throw std::runtime_error("Invalid edge: "+line);
+        if(u==v)continue;
+        if(!directed&&u>v)std::swap(u,v);
+        edges.emplace_back(u,v);labels.push_back(u);labels.push_back(v);
+    }
+    std::sort(labels.begin(),labels.end());
+    labels.erase(std::unique(labels.begin(),labels.end()),labels.end());
+    if(labels.size()<2)throw std::runtime_error("Graph requires at least two vertices");
+    std::sort(edges.begin(),edges.end());edges.erase(std::unique(edges.begin(),edges.end()),edges.end());
+    Graph g;g.directed=directed;g.labels=std::move(labels);g.m=edges.size();
+    g.out.resize(g.n());g.incoming.resize(g.n());
+    for(const auto& [a,b]:edges) {
+        int u=static_cast<int>(std::lower_bound(g.labels.begin(),g.labels.end(),a)-g.labels.begin());
+        int v=static_cast<int>(std::lower_bound(g.labels.begin(),g.labels.end(),b)-g.labels.begin());
+        g.out[u].push_back(v);g.incoming[v].push_back(u);
+        if(!directed){g.out[v].push_back(u);g.incoming[u].push_back(v);}
+    }
+    for(auto& e:g.out)std::sort(e.begin(),e.end());
+    for(auto& e:g.incoming)std::sort(e.begin(),e.end());
+    return g;
+}
+struct Arguments {
+    std::map<std::string,std::string> values;
+    bool directed=false;
+    Arguments(int argc,char** argv) {
+        for(int i=1;i<argc;++i){
+            std::string key=argv[i];
+            if(key=="--directed"){directed=true;continue;}
+            if(key=="--help"){
+                std::cout<<"Required: --graph EDGELIST --k K; optional: --directed, --seed N, --output FILE. See README.md.\n";
+                std::exit(0);
+            }
+            if(key.rfind("--",0)!=0||i+1==argc)throw std::invalid_argument("Invalid CLI option: "+key);
+            values[key]=argv[++i];
+        }
+    }
+    std::string get(const std::string& key,const std::string& fallback="")const {
+        auto it=values.find(key);return it==values.end()?fallback:it->second;
+    }
+    int k(int n)const {
+        int value=std::stoi(get("--k","0"));
+        if(value<1||value>=n)throw std::invalid_argument("Expected 1 <= k < n");
+        return value;
+    }
+};
+inline std::string quoted(const std::string& s){
+    std::ostringstream out;out<<'"';
+    for(char ch:s){if(ch=='"'||ch=='\\')out<<'\\';if(ch=='\n'){out<<"\\n";continue;}out<<ch;}
+    out<<'"';return out.str();
+}
+inline void emit(const Arguments& args,const Graph& g,const std::string& name,
+                 const std::vector<int>& selected,const std::map<std::string,std::string>& extra){
+    std::ostringstream out;out<<std::setprecision(18);
+    out<<"{\n  \"method\": "<<quoted(name)<<",\n  \"graph\": "<<quoted(args.get("--graph"))
+       <<",\n  \"directed\": "<<(g.directed?"true":"false")
+       <<",\n  \"num_nodes\": "<<g.n()<<",\n  \"num_edges\": "<<g.m
+       <<",\n  \"k\": "<<selected.size()<<",\n  \"nodes\": [";
+    for(std::size_t i=0;i<selected.size();++i){if(i)out<<", ";out<<g.labels[selected[i]];}
+    out<<"]";
+    for(const auto& [key,value]:extra)out<<",\n  "<<quoted(key)<<": "<<value;
+    out<<"\n}\n";
+    std::cout<<out.str();
+    if(!args.get("--output").empty()){
+        std::ofstream file(args.get("--output"));
+        if(!file)throw std::runtime_error("Cannot write output");
+        file<<out.str();
+    }
+}
+struct Workspace{
+    std::vector<int> dist,order;
+    std::vector<long double> sigma;
+    explicit Workspace(int n):dist(n,-1),sigma(n,0){order.reserve(n);}
+    void bfs(const Graph& g,int s,int stop_at=-1){
+        std::fill(dist.begin(),dist.end(),-1);
+        std::fill(sigma.begin(),sigma.end(),0.0L);
+        order.clear();std::queue<int> q;q.push(s);dist[s]=0;sigma[s]=1;
+        while(!q.empty()){
+            int u=q.front();q.pop();
+            if(stop_at>=0&&dist[stop_at]>=0&&dist[u]>=dist[stop_at])break;
+            order.push_back(u);
+            for(int v:g.out[u]){
+                if(dist[v]<0){dist[v]=dist[u]+1;q.push(v);}
+                if(dist[v]==dist[u]+1)sigma[v]+=sigma[u];
+            }
+        }
+    }
+};
+inline Path sample(const Graph& g,Workspace& ws,std::mt19937_64& rng){
+    std::uniform_int_distribution<int> node(0,g.n()-1);
+    int s=node(rng),t=node(rng);while(t==s)t=node(rng);
+    ws.bfs(g,s,t);Path path;
+    if(ws.dist[t]<0)return path;
+    while(t!=s){
+        long double sum=0;
+        for(int v:g.incoming[t])if(ws.dist[v]==ws.dist[t]-1)sum+=ws.sigma[v];
+        if(sum<=0)throw std::logic_error("Missing predecessor");
+        std::uniform_real_distribution<long double> pick(0,sum);
+        long double x=pick(rng);int prev=-1;
+        for(int v:g.incoming[t])if(ws.dist[v]==ws.dist[t]-1){
+            prev=v;x-=ws.sigma[v];if(x<=0)break;
+        }
+        t=prev;
+        if(t!=s)path.push_back(t);
+    }
+    return path;
+}
+inline std::vector<int> greedy(const std::vector<Path>& paths,int n,int k,std::size_t& covered){
+    std::vector<std::vector<int>> incident(n);
+    for(std::size_t i=0;i<paths.size();++i)for(int v:paths[i])incident[v].push_back(static_cast<int>(i));
+    std::vector<int> gain(n),selected;std::vector<unsigned char> picked(n,0),hit(paths.size(),0);
+    for(int v=0;v<n;++v)gain[v]=static_cast<int>(incident[v].size());
+    covered=0;
+    for(int step=0;step<k;++step){
+        int best=-1;
+        for(int v=0;v<n;++v)if(!picked[v]&&(best<0||gain[v]>gain[best]))best=v;
+        picked[best]=1;selected.push_back(best);
+        for(int id:incident[best])if(!hit[id]){
+            hit[id]=1;++covered;
+            for(int v:paths[id])--gain[v];
+        }
+    }
+    return selected;
+}
+// Exact marginal B(C union {u})-B(C) for EVERY u, in one all-source pass.
+// For one source, prefix[v] counts geodesics s->v avoiding internal C.
+// suffix[v] sums reciprocal sigma_all[t] for suffixes from v to targets t.
+// A group node may be a target but cannot be continued through.
+inline std::vector<long double> exact_marginals(const Graph& g,const std::vector<unsigned char>& in_group){
+    int n=g.n();std::vector<long double> result(n,0),prefix(n),suffix(n);
+    Workspace ws(n);
+    for(int s=0;s<n;++s){
+        ws.bfs(g,s);
+        std::fill(prefix.begin(),prefix.end(),0);prefix[s]=1;
+        for(int v:ws.order){
+            if(v!=s&&in_group[v])continue;
+            for(int w:g.out[v])if(ws.dist[w]==ws.dist[v]+1)prefix[w]+=prefix[v];
+        }
+        std::fill(suffix.begin(),suffix.end(),0);
+        for(auto it=ws.order.rbegin();it!=ws.order.rend();++it){
+            int v=*it;
+            for(int w:g.out[v])if(ws.dist[w]==ws.dist[v]+1)
+                suffix[v]+=1.0L/ws.sigma[w]+(in_group[w]?0.0L:suffix[w]);
+            if(v!=s&&!in_group[v])result[v]+=prefix[v]*suffix[v];
+        }
+    }
+    return result;
+}
+inline int best_unselected(const std::vector<long double>& scores,const std::vector<unsigned char>& picked){
+    int best=-1;
+    for(std::size_t v=0;v<scores.size();++v)if(!picked[v]&&
+        (best<0||scores[v]>scores[best]+1e-14L))best=static_cast<int>(v);
+    return best;
+}
+} // namespace gbc
+
+namespace {
+double top_positive_sum(std::vector<std::int64_t>& scores,int k){
+    std::sort(scores.begin(),scores.end(),std::greater<>());
+    double result=0;
+    for(int i=0;i<k&&i<static_cast<int>(scores.size());++i)
+        if(scores[i]>0)result+=static_cast<double>(scores[i]);
+    return result;
+}
+std::string number(long double v){std::ostringstream o;o<<std::setprecision(18)<<v;return o.str();}
+}
+int main(int argc,char** argv){
+    try{
+        gbc::Arguments args(argc,argv);
+        const auto g=gbc::load(args.get("--graph"),args.directed);
+        const int k=args.k(g.n());
+        const double epsilon=std::stod(args.get("--epsilon","0.1"));
+        const double delta=std::stod(args.get("--delta","0.05"));
+        const int trials=std::stoi(args.get("--trials","100"));
+        const std::size_t initial=std::stoull(args.get("--initial-samples","512"));
+        const std::uint64_t seed=std::stoull(args.get("--seed","1"));
+        const double A=1.0-1.0/std::exp(1.0);
+        if(!(epsilon>0&&epsilon<A&&delta>0&&delta<1)||trials<1||initial<1)
+            throw std::invalid_argument("Invalid epsilon, delta, trials or initial sample count");
+        if(!args.get("--max-samples").empty())
+            throw std::invalid_argument("CentRA has no fixed sample cap; remove --max-samples");
+        std::mt19937_64 path_rng(seed),sign_rng(seed^0x9e3779b97f4a7c15ULL);
+        std::uniform_int_distribution<int> sign(0,1);
+        gbc::Workspace ws(g.n());
+        std::vector<gbc::Path> hyperedges;
+        std::vector<std::vector<std::int64_t>> signed_freq(
+            trials,std::vector<std::int64_t>(g.n(),0));
+        std::vector<std::int64_t> freq(g.n(),0);
+        std::vector<int> chosen;
+        std::size_t max_card=0,target=initial,covered=0;
+        int rounds=0;double eta=0,xi=0,coverage=0;
+        std::string status="stopping_condition_met";
+        while(true){
+            if(target>static_cast<std::size_t>(std::numeric_limits<int>::max()))
+                throw std::overflow_error("CentRA path count exceeds indexed hyperedge capacity");
+            while(hyperedges.size()<target){
+                hyperedges.push_back(gbc::sample(g,ws,path_rng));
+                const auto& path=hyperedges.back();
+                max_card=std::max(max_card,path.size());
+                for(int v:path)++freq[v];
+                for(int j=0;j<trials;++j){
+                    const int value=sign(sign_rng)?1:-1;
+                    for(int v:path)signed_freq[j][v]+=value;
+                }
+            }
+            const double m=static_cast<double>(hyperedges.size());
+            chosen=gbc::greedy(hyperedges,g.n(),k,covered);
+            coverage=static_cast<double>(covered)/m;
+            ++rounds;
+            const double log_term=std::log(5.0/delta)+rounds*std::log(2.0);
+            const double x=log_term/m;
+            // Theorem 4.3: C(S*) <= coverage/A + xi.
+            xi=x+std::sqrt(x*x+2.0*coverage*x/A);
+            const double nu=coverage/A+xi;
+            double mcera=0;
+            for(int j=0;j<trials;++j){
+                auto copy=signed_freq[j];
+                mcera+=top_positive_sum(copy,k)/(trials*m);
+            }
+            auto freq_copy=freq;
+            const double wimpy=static_cast<double>(max_card)*top_positive_sum(freq_copy,k)/m;
+            // Theorem 4.4, Eq. (2): upper bound eta on supremum deviation.
+            const double r_bar=mcera+std::sqrt(4.0*wimpy*log_term/(trials*m));
+            const double R=r_bar+x+std::sqrt(x*x+2.0*x*r_bar);
+            eta=2.0*R+std::sqrt(2.0*log_term*(nu+4.0*R)/m)+x/3.0;
+            const bool certified=A*(A-epsilon)*xi+eta<=epsilon*coverage;
+            std::cerr<<"[CentRA] round="<<rounds<<" samples="<<target
+                     <<" empirical="<<coverage<<" eta="<<eta
+                     <<" xi="<<xi<<" stop="<<certified<<'\n';
+            if(certified){status="stopping_condition_met";break;}
+            if(target>std::numeric_limits<std::size_t>::max()/2)
+                throw std::overflow_error("CentRA sample schedule exceeds size_t");
+            const std::size_t next=static_cast<std::size_t>(
+                std::ceil(1.2L*static_cast<long double>(target)));
+            target=std::max(target+1,next);
+        }
+        gbc::emit(args,g,"CentRA",chosen,{{"estimated_gbc",number(coverage)},
+                  {"samples",std::to_string(hyperedges.size())},{"rounds",std::to_string(rounds)},
+                  {"samples_total",std::to_string(hyperedges.size())},
+                  {"sample_schedule",gbc::quoted("geometric_1.2_until_paper_stopping_condition")},
+                  {"sample_rule",gbc::quoted("geometric_1.2_until_paper_stopping_condition")},
+                  {"epsilon",number(epsilon)},{"delta",number(delta)},
+                  {"trials",std::to_string(trials)},{"eta",number(eta)},
+                  {"xi",number(xi)},{"seed",std::to_string(seed)},
+                  {"status",gbc::quoted(status)}});
+        return 0;
+    }catch(const std::exception& e){std::cerr<<"CentRA: "<<e.what()<<'\n';return 1;}
+}
